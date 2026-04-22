@@ -1,64 +1,11 @@
 package main
 
 import (
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
-	"math"
-	"strconv"
-	"strings"
 	"time"
 )
-
-func stringParse(str string) (uint, []float64) {
-	if str == "" {
-		return 0, nil
-	}
-	// 先看下是否是单个值
-	if !strings.Contains(str, ",") {
-		// 单个值
-		// 是否为16进制
-		if strings.HasPrefix(str, "0x") || strings.HasPrefix(str, "0X") {
-			v, err := strconv.ParseUint(str[2:], 16, 64)
-			if err != nil {
-				log.Println("ParseUint error: ", err)
-				return 0, nil
-			}
-			return 1, []float64{float64(v)}
-		} else {
-			v, err := strconv.ParseFloat(str, 64)
-			if err != nil {
-				log.Println("ParseFloat error: ", err)
-				return 0, nil
-			}
-			return 1, []float64{v}
-		}
-	} else {
-		// 多个值
-		parts := strings.Split(str, ",")
-		var values []float64
-		for _, s := range parts {
-			// 是否为16进制
-			if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-				v, err := strconv.ParseUint(s[2:], 16, 64)
-				if err != nil {
-					log.Println("ParseUint error: ", err)
-					return 0, nil
-				}
-				values = append(values, float64(v))
-			} else {
-				v, err := strconv.ParseFloat(s, 64)
-				if err != nil {
-					log.Println("ParseFloat error: ", err)
-					return 0, nil
-				}
-				values = append(values, v)
-			}
-		}
-		return uint(len(values)), values
-	}
-}
 
 func main() {
 	var err error
@@ -87,182 +34,138 @@ func main() {
 		return
 	}
 
-	// 构建客户端
-	client := NewMBClient(address, byte(slaveId))
-	if client == nil {
-		return
-	}
-	if strings.Contains(regType, "L") {
-		client.SetByteSequence(true)
-	}
-
-	startAddr, err := strconv.ParseUint(startAddrStr, 0, 0)
+	spec, err := parseRegisterSpec(regType)
 	if err != nil {
-		fmt.Printf("%v", err)
+		log.Println(err)
+		return
+	}
+	startAddr, err := parseUint16Param("start address", startAddrStr)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	slaveID, err := parseByteParam("slave id", slaveId)
+	if err != nil {
+		log.Println(err)
 		return
 	}
 
-	var registerType = "3"
-	if regType[0] == '4' {
-		registerType = "4"
-	} else if regType[0] == '1' {
-		registerType = "1"
-	} else if regType[0] == '2' {
-		registerType = "2"
+	if spec.isWrite() {
+		err = validateWriteRequest(spec, startAddr, valuesStr)
+	} else {
+		err = validateReadCount(spec, cnt)
+		if err == nil {
+			err = validateAddressRange(startAddr, uint16(cnt))
+		}
+	}
+	if err != nil {
+		log.Println(err)
+		return
 	}
 
-	if strings.Contains(regType, "W") {
-		varCnt, values := stringParse(valuesStr)
-		if varCnt == 0 {
-			log.Fatalf("value string: %s parse error\n", valuesStr)
+	client, err := NewMBClient(address, slaveID)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Println("Close error:", err)
+		}
+	}()
+	client.SetByteSequence(spec.littleEndian)
+
+	if spec.isWrite() {
+		if err := writeRegisters(client, spec, startAddr, valuesStr); err != nil {
+			log.Println(err)
+		}
+		return
+	}
+
+	for {
+		if err := readRegisters(client, spec, startAddr, uint16(cnt)); err != nil {
+			log.Println(err)
 			return
 		}
-		if strings.Contains(regType, "F") {
-			// 要写入浮点数
-			err = client.WriteFloats(uint16(startAddr), values...)
-			if err != nil {
-				log.Println("WriteMultipleRegisters error: ", err)
-				return
-			}
-		} else if strings.Contains(regType, "U") || strings.Contains(regType, "S") {
-			// 要写入U32或者S32
-			err = client.WriteMultiU32(uint16(startAddr), values...)
-			if err != nil {
-				log.Println("WriteMultipleRegisters error: ", err)
-				return
-			}
-		} else {
-			if varCnt == 1 {
-				// 写单个寄存器
-				v := uint16(values[0])
-				err = client.WriteU16(uint16(startAddr), v)
-				if err != nil {
-					log.Println("WriteSingleRegister error: ", err)
-					return
-				}
-				return
-			} else {
-				datas := make([]uint16, varCnt)
-				for i, v := range values {
-					datas[i] = uint16(v)
-				}
-				err = client.WriteMultiU16(uint16(startAddr), datas...)
-				if err != nil {
-					log.Println("WriteMultipleRegisters error: ", err)
-					return
-				}
-			}
+		if !multiRead {
+			break
 		}
-	} else {
-		for {
-			var results []byte
-			if registerType == "3" {
-				results, err = client.client.ReadHoldingRegisters(uint16(startAddr), uint16(cnt))
-			} else if registerType == "1" {
-				results, err = client.client.ReadCoils(uint16(startAddr), uint16(cnt))
-			} else if registerType == "2" {
-				results, err = client.client.ReadDiscreteInputs(uint16(startAddr), uint16(cnt))
-			} else {
-				results, err = client.client.ReadInputRegisters(uint16(startAddr), uint16(cnt))
-			}
-
-			if err != nil {
-				log.Println("ReadHoldingRegisters error: ", err)
-				return
-			}
-
-			var dataType = regType[1:]
-			// 功能码 1(线圈) 和 2(离散输入) 返回的是位数据，每字节 8 个位
-			if registerType == "1" || registerType == "2" {
-				var j uint64 = 0
-				for i := 0; i < len(results) && j < uint64(cnt); i++ {
-					for b := 0; b < 8 && j < uint64(cnt); b++ {
-						value := (results[i] >> b) & 1
-						log.Printf("addr: 0x%02X:%d  value: %d (%s)", startAddr+j, startAddr+j, value, map[byte]string{0: "OFF", 1: "ON"}[value])
-						j++
-					}
-				}
-			} else if dataType == "U" {
-				// uint32
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 4 {
-					value := binary.BigEndian.Uint32(results[i:])
-					log.Printf("addr: 0x%02X:%d  value: 0x%08X : %d", startAddr+j, startAddr+j, value, value)
-					j += 2
-				}
-			} else if dataType == "UL" {
-				// uint32 little endian
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 4 {
-					l := binary.LittleEndian.Uint16(results[i:])
-					h := binary.LittleEndian.Uint16(results[i+2:])
-					value := uint32(h)<<16 | uint32(l)
-					log.Printf("addr: 0x%02X:%d  value: 0x%08X : %d", startAddr+j, startAddr+j, value, value)
-					j += 2
-				}
-			} else if dataType == "S" {
-				// int32
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 4 {
-					value := int32(binary.BigEndian.Uint32(results[i:]))
-					log.Printf("addr: 0x%02X:%d  value: 0x%08X : %d", startAddr+j, startAddr+j, value, value)
-					j += 2
-				}
-			} else if dataType == "SL" {
-				// int32 little endian
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 4 {
-					l := binary.LittleEndian.Uint16(results[i:])
-					h := binary.LittleEndian.Uint16(results[i+2:])
-					value := int32(uint32(h)<<16 | uint32(l))
-					log.Printf("addr: 0x%02X:%d  value: 0x%08X : %d", startAddr+j, startAddr+j, value, value)
-					j += 2
-				}
-			} else if dataType == "s" {
-				// int16
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 2 {
-					value := int16(binary.BigEndian.Uint16(results[i:]))
-					log.Printf("addr: 0x%02X:%d  value: %02X : %d", startAddr+j, startAddr+j, value, value)
-					j++
-				}
-			} else if dataType == "F" {
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 4 {
-					value := math.Float32frombits(binary.BigEndian.Uint32(results[i:]))
-					log.Printf("addr: 0x%02X:%d  value: %f", startAddr+j, startAddr+j, value)
-					j += 2
-				}
-			} else if dataType == "FL" {
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 4 {
-					l := binary.BigEndian.Uint16(results[i:])
-					h := binary.BigEndian.Uint16(results[i+2:])
-					var data = uint32(h)<<16 | uint32(l)
-					f := math.Float32frombits(data)
-					fmt.Printf("Addr: 0x%02x:%d, value: %g\n", startAddr+j, startAddr+j, f)
-					j += 2
-				}
-			} else {
-				var j uint64 = 0
-				for i := 0; i < len(results); i += 2 {
-					value := binary.BigEndian.Uint16(results[i:])
-					log.Printf("addr: 0x%02X:%d  value: 0x%02X : %d", startAddr+j, startAddr+j, value, value)
-					j++
-				}
-			}
-			if !multiRead {
-				break
-			} else {
-				select {
-				case <-time.After(time.Duration(multiReadTime) * time.Millisecond):
-				}
-			}
-		}
+		time.Sleep(time.Duration(multiReadTime) * time.Millisecond)
 	}
 }
 
-// 添加显示帮助的函数
+func validateWriteRequest(spec registerSpec, startAddr uint16, valuesStr string) error {
+	values, err := parseWriteValues(spec, valuesStr)
+	if err != nil {
+		return err
+	}
+	var quantity uint
+	switch spec.valueType {
+	case valueUint32, valueInt32, valueFloat32:
+		quantity = uint(len(values.u32) * 2)
+		if spec.valueType == valueFloat32 {
+			quantity = uint(len(values.f32) * 2)
+		}
+	case valueUint16, valueInt16:
+		quantity = uint(len(values.u16))
+	default:
+		return fmt.Errorf("unsupported value type %q", spec.valueType)
+	}
+	if quantity == 0 {
+		return fmt.Errorf("value is required for write")
+	}
+	if quantity > maxRegisterWriteQty {
+		return fmt.Errorf("write register quantity must be <= %d", maxRegisterWriteQty)
+	}
+	return validateAddressRange(startAddr, uint16(quantity))
+}
+
+func writeRegisters(client *MBClient, spec registerSpec, startAddr uint16, valuesStr string) error {
+	values, err := parseWriteValues(spec, valuesStr)
+	if err != nil {
+		return err
+	}
+	switch spec.valueType {
+	case valueUint32, valueInt32:
+		err = client.WriteMultiU32(startAddr, values.u32...)
+	case valueFloat32:
+		err = client.WriteFloats(startAddr, values.f32...)
+	case valueUint16, valueInt16:
+		if len(values.u16) == 1 && spec.writeMode == writeModeAuto {
+			err = client.WriteU16(startAddr, values.u16[0])
+		} else {
+			err = client.WriteMultiU16(startAddr, values.u16...)
+		}
+	default:
+		return fmt.Errorf("unsupported value type %q", spec.valueType)
+	}
+	if err != nil {
+		return fmt.Errorf("write registers error: %w", err)
+	}
+	return nil
+}
+
+func readRegisters(client *MBClient, spec registerSpec, startAddr uint16, cnt uint16) error {
+	var results []byte
+	var err error
+	switch spec.function {
+	case functionHoldingRegs:
+		results, err = client.client.ReadHoldingRegisters(startAddr, cnt)
+	case functionCoils:
+		results, err = client.client.ReadCoils(startAddr, cnt)
+	case functionDiscreteInputs:
+		results, err = client.client.ReadDiscreteInputs(startAddr, cnt)
+	case functionInputRegs:
+		results, err = client.client.ReadInputRegisters(startAddr, cnt)
+	default:
+		return fmt.Errorf("unsupported function code %q", spec.function)
+	}
+	if err != nil {
+		return fmt.Errorf("read registers error: %w", err)
+	}
+	return logReadResults(spec, startAddr, cnt, results)
+}
+
 func showHelp() {
 	fmt.Println("Modbus 工具 - 读写 Modbus 设备寄存器")
 	fmt.Println()
@@ -275,14 +178,15 @@ func showHelp() {
 	fmt.Println("                   格式2（串口）: /dev/ttyS9:9600:8N1")
 	fmt.Println()
 	fmt.Println("  -t string        寄存器类型（默认：3u）")
-	fmt.Println("                   格式: [功能码][数据类型][字节序]")
+	fmt.Println("                   格式: [功能码][数据类型][字节序][写操作]")
 	fmt.Println("                   功能码: 1(线圈), 2(离散输入), 3(保持寄存器), 4(输入寄存器)")
 	fmt.Println("                   数据类型: U(uint32), S(int32), u(uint16) s(int16), F(float32)")
 	fmt.Println("                   字节序: L(小端字节序), 默认大端字节序")
-	fmt.Println("                   写操作: 在类型后加 W")
+	fmt.Println("                   写操作: 仅功能码3支持，W 固定使用 0x10，w 单个寄存器用 0x06、多个用 0x10")
 	fmt.Println("                   示例:")
 	fmt.Println("                     -t 3U     读取保持寄存器为 uint32")
-	fmt.Println("                     -t 3UW    写入保持寄存器为 uint32")
+	fmt.Println("                     -t 3UW    用 0x10 写入保持寄存器为 uint32")
+	fmt.Println("                     -t 3uw    写入 uint16，单个值用 0x06，多个值用 0x10")
 	fmt.Println("                     -t 4FL    读取输入寄存器为 float32（小端）")
 	fmt.Println("                     -t 3SW    写入保持寄存器为 int32")
 	fmt.Println()
@@ -290,8 +194,8 @@ func showHelp() {
 	fmt.Println("                   支持十进制和十六进制（0x开头）")
 	fmt.Println("                   示例: -r 10, -r 0x0A")
 	fmt.Println()
-	fmt.Println("  -c uint          读取数量（默认：1）")
-	fmt.Println("                   对于32位数据类型，一个值占用2个寄存器")
+	fmt.Println("  -c uint          读取寄存器/线圈数量（默认：1）")
+	fmt.Println("                   对于32位数据类型必须为偶数，一个值占用2个寄存器")
 	fmt.Println()
 	fmt.Println("  -a uint          从站ID/设备地址（默认：1）")
 	fmt.Println()
